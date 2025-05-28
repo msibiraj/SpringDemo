@@ -1,0 +1,96 @@
+name: Deploy to Google Cloud Run
+
+on:
+  push:
+    branches: [ master ]  # triggers deployment when you push to the main branch
+
+env:
+  SERVICE_NAME: springboot-service
+  REGION: ${{ secrets.REGION }}
+  PROJECT_ID: ${{ secrets.PROJECT_ID }}
+  REPO_NAME: ${{ secrets.REPO_NAME }}
+
+jobs:
+  deploy:
+    name: Build & Deploy to GCP
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.GCP_CREDENTIALS }}
+          project_id: ${{ secrets.PROJECT_ID }}
+          export_default_credentials: true
+
+      - name: Configure Docker for GCP Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Make mvnw executable
+        run: chmod +x mvnw
+
+      - name: Build Docker image
+        run: |
+          ./mvnw clean package -DskipTests
+          docker build -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/springboot-app .
+    
+
+      - name: Push Docker image to Artifact Registry
+        run: |
+          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/springboot-app
+
+      - name: Create env file for Cloud Run
+        run: |
+          echo "DATABASE_URL: \"${{ secrets.DATABASE_URL }}\"" > env.yaml
+          echo "DATABASE_NAME: \"${{ secrets.DATABASE_NAME }}\"" >> env.yaml
+          echo "BASE_URL: \"${{ secrets.BASE_URL }}\"" >> env.yaml         
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/springboot-app \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --allow-unauthenticated \
+            --memory=512Mi \
+            --cpu=1 \
+            --max-instances=1 \
+            --concurrency=80 \
+            --env-vars-file=env.yaml
+
+      - name: Clean up old Cloud Run revisions
+        run: |
+          SERVICE_NAME=${{ env.SERVICE_NAME }}
+          REGION=${{ env.REGION }}
+          KEEP=3
+
+          # List revisions sorted by creation timestamp ascending (oldest first)
+          revisions=($(gcloud run revisions list --service=$SERVICE_NAME --region=$REGION --format="value(metadata.name)" --sort-by=metadata.creationTimestamp))
+
+          # Calculate number of revisions to delete
+          total=${#revisions[@]}
+          num_to_delete=$((total - KEEP))
+
+          if [ $num_to_delete -gt 0 ]; then
+            # Delete the oldest revisions, skip the newest $KEEP
+            for ((i=0; i<num_to_delete; i++)); do
+              echo "Deleting revision: ${revisions[i]}"
+              gcloud run revisions delete "${revisions[i]}" --region=$REGION --quiet || echo "Failed to delete ${revisions[i]}"
+            done
+          else
+            echo "No revisions to delete. Keeping last $KEEP revisions."
+          fi
